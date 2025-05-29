@@ -13,27 +13,25 @@ def procesar_sql(contenido):
     cambios_realizados = False
     original = contenido
     
-    # 1. Reemplazar JOIN por INNER JOIN (excluyendo los que ya tienen especificador)
-    join_pattern = re.compile(r'''
-        (?<!\w)                      # No debe haber palabra antes
-        (?<!\bINNER\s)               # No debe ser INNER JOIN
-        (?<!\bLEFT\s)                # No debe ser LEFT JOIN
-        (?<!\bRIGHT\s)               # No debe ser RIGHT JOIN
-        (?<!\bFULL\s)                # No debe ser FULL JOIN
-        (?<!\bOUTER\s)               # No debe ser OUTER JOIN
-        (?<!\b(?:LOOP|HASH|MERGE)\s) # No debe ser LOOP/HASH/MERGE JOIN
-        \bJOIN\b                     # La palabra JOIN
-    ''', re.IGNORECASE | re.VERBOSE)
-    
-    contenido = join_pattern.sub('INNER JOIN', contenido)
-    
-    if contenido != original:
+    # 1. Reemplazar JOIN por INNER JOIN (versión corregida sin lookbehind problemático)
+    def replacer(match):
+        nonlocal cambios_realizados
         cambios_realizados = True
-        original = contenido
+        return 'INNER JOIN'
+    
+    # Patrón más simple que evita lookbehind complejo
+    join_pattern = re.compile(r'''
+        (^|\s)                    # Inicio de línea o espacio
+        (?!\b(?:INNER|LEFT|RIGHT|FULL|OUTER|LOOP|HASH|MERGE)\s+JOIN\b)  # No debe tener modificador
+        \bJOIN\b                  # La palabra JOIN
+        (?=\s)                    # Seguido de espacio
+    ''', re.IGNORECASE | re.VERBOSE | re.MULTILINE)
+    
+    contenido = join_pattern.sub(r'\1INNER JOIN', contenido)
     
     # 2. Agregar WITH (NOLOCK) a todas las tablas, incluyendo subconsultas
     # Excepto en operaciones UPDATE/DELETE directas
-    is_update_or_delete = re.search(r'\b(?:UPDATE|DELETE)\b', contenido, re.IGNORECASE)
+    is_update_or_delete = re.search(r'^\s*(?:UPDATE|DELETE)\b', contenido, re.IGNORECASE | re.MULTILINE)
     
     if not is_update_or_delete:
         # Patrón mejorado que detecta tablas en FROM/JOIN incluyendo subconsultas
