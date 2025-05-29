@@ -2,7 +2,6 @@ import re
 import os
 from pathlib import Path
 
-# Configuración de colores para la terminal
 class bcolors:
     BLUE = '\033[94m'
     GREEN = '\033[92m'
@@ -12,35 +11,41 @@ class bcolors:
 
 def procesar_sql(contenido):
     cambios_realizados = False
-    
-    # Guardar contenido original para comparación
     original = contenido
     
-    # 1. Reemplazar JOIN por INNER JOIN (sin afectar LEFT/RIGHT/OUTER/etc. JOIN)
-    join_pattern = re.compile(r'(?<!\w)(?<!\bINNER\s)(?<!\bLEFT\s)(?<!\bRIGHT\s)(?<!\bFULL\s)(?<!\bOUTER\s)\bJOIN\b', re.IGNORECASE)
+    # 1. Reemplazar JOIN por INNER JOIN (excluyendo los que ya tienen especificador)
+    join_pattern = re.compile(r'''
+        (?<!\w)                      # No debe haber palabra antes
+        (?<!\bINNER\s)               # No debe ser INNER JOIN
+        (?<!\bLEFT\s)                # No debe ser LEFT JOIN
+        (?<!\bRIGHT\s)               # No debe ser RIGHT JOIN
+        (?<!\bFULL\s)                # No debe ser FULL JOIN
+        (?<!\bOUTER\s)               # No debe ser OUTER JOIN
+        (?<!\b(?:LOOP|HASH|MERGE)\s) # No debe ser LOOP/HASH/MERGE JOIN
+        \bJOIN\b                     # La palabra JOIN
+    ''', re.IGNORECASE | re.VERBOSE)
+    
     contenido = join_pattern.sub('INNER JOIN', contenido)
     
-    # Verificar si hubo cambios en los JOIN
     if contenido != original:
         cambios_realizados = True
         original = contenido
     
-    # 2. Agregar WITH (NOLOCK) a tablas en SELECT (excepto en UPDATE/DELETE)
-    if 'UPDATE ' not in contenido.upper() and 'DELETE ' not in contenido.upper():
-        # Patrón mejorado para identificar nombres de tabla en FROM/JOIN
+    # 2. Agregar WITH (NOLOCK) a todas las tablas, incluyendo subconsultas
+    # Excepto en operaciones UPDATE/DELETE directas
+    is_update_or_delete = re.search(r'\b(?:UPDATE|DELETE)\b', contenido, re.IGNORECASE)
+    
+    if not is_update_or_delete:
+        # Patrón mejorado que detecta tablas en FROM/JOIN incluyendo subconsultas
         table_pattern = re.compile(r'''
-            (\bFROM\b|\b(?:INNER|LEFT|RIGHT|FULL|OUTER)?\s+JOIN\b)\s+   # Cláusula FROM o JOIN
-            (?:                           # Nombre de tabla puede ser:
-            (\[[^\]]+\]\.\[[^\]]+\])     # [esquema].[tabla]
-            |(\[[^\]]+\])                 # [tabla]
-            |([a-zA-Z_][\w]*)\.([a-zA-Z_][\w]*)  # esquema.tabla
-            |([a-zA-Z_#@][\w]*)          # tabla simple (incluye # y @)
-            |(\(.*?\))                   # subconsultas entre paréntesis
+            (\bFROM\b|\b(?:INNER|LEFT|RIGHT|FULL|OUTER)?\s+(?:LOOP|HASH|MERGE)?\s*JOIN\b)\s+  # Cláusula FROM o JOIN
+            (
+                (?:\[[^\]]+\]\.\[[^\]]+\]|\[[^\]]+\]|[a-zA-Z_][\w]*\.[a-zA-Z_][\w]*|[a-zA-Z_#@][\w]*)  # Nombre de tabla
+                (?!\s*\b(?:WITH|WHERE|GROUP|HAVING|ORDER|UNION|EXCEPT|INTERSECT)\b)  # No capturar palabras clave después
             )
-            (?:\s+(?:AS\s+)?            # Alias opcional
-            (?:(\[[^\]]+\])|([a-zA-Z_][\w]*))?  # Alias con corchetes o sin ellos
-            )?
-        ''', re.IGNORECASE | re.VERBOSE | re.DOTALL)
+            (?:\s+(?:AS\s+)?(\[[^\]]+\]|[a-zA-Z_][\w]*)?)?  # Alias opcional
+            (?=\s+|$)  # Lookahead para espacio o fin de línea
+        ''', re.IGNORECASE | re.VERBOSE)
         
         def agregar_nolock(match):
             nonlocal cambios_realizados
@@ -48,31 +53,27 @@ def procesar_sql(contenido):
             if 'WITH (NOLOCK)' in full_match.upper():
                 return full_match
             
-            parts = list(match.groups())
-            clause = parts[0]
+            clause = match.group(1)  # FROM o JOIN
+            table_name = match.group(2)  # Nombre de tabla
+            alias = match.group(3)  # Alias si existe
             
-            table_name = ''
-            if parts[1]: table_name = parts[1]
-            elif parts[2]: table_name = parts[2]
-            elif parts[3] and parts[4]: table_name = f"{parts[3]}.{parts[4]}"
-            elif parts[5]: table_name = parts[5]
-            elif parts[6]: return full_match
-            
+            # Omitir solo tablas temporales y variables de tabla
             if table_name.startswith('#') or table_name.startswith('@'):
                 return full_match
             
-            alias = ''
-            if parts[7]: alias = parts[7]
-            elif parts[8]: alias = parts[8]
+            # Determinar si lo que sigue es una palabra clave SQL
+            next_text = contenido[match.end():match.end()+20]
+            if any(re.match(r'^\s*\b'+kw+r'\b', next_text, re.IGNORECASE) 
+               for kw in ['WHERE', 'GROUP', 'HAVING', 'ORDER', 'UNION', 'EXCEPT', 'INTERSECT', 'ON']):
+                alias = None
             
             cambios_realizados = True
-            result = f"{clause} {table_name}"
             if alias:
-                result += f" {alias}"
-            result += " WITH (NOLOCK)"
-            
-            return result
+                return f"{clause} {table_name} {alias} WITH (NOLOCK)"
+            else:
+                return f"{clause} {table_name} WITH (NOLOCK)"
         
+        # Procesar todo el contenido (incluyendo subconsultas)
         contenido = table_pattern.sub(agregar_nolock, contenido)
     
     return contenido, cambios_realizados
@@ -95,23 +96,11 @@ def procesar_archivo(archivo):
         print(f"{bcolors.RED}[ERROR]{bcolors.ENDC} {archivo} - {str(e)}")
 
 def procesar_directorio(directorio):
-    total_archivos = 0
-    modificados = 0
-    errores = 0
-    
     for root, _, files in os.walk(directorio):
         for file in files:
             if file.lower().endswith('.sql'):
-                total_archivos += 1
                 archivo_completo = os.path.join(root, file)
                 procesar_archivo(archivo_completo)
-    
-    # Resumen estadístico
-    print(f"\n{bcolors.BOLD}Resumen del procesamiento:{bcolors.ENDC}")
-    print(f"- Archivos procesados: {total_archivos}")
-    print(f"- {bcolors.GREEN}Archivos modificados: {modificados}{bcolors.ENDC}")
-    print(f"- {bcolors.BLUE}Archivos sin cambios: {total_archivos - modificados - errores}{bcolors.ENDC}")
-    print(f"- {bcolors.RED}Archivos con errores: {errores}{bcolors.ENDC}")
 
 def main():
     if len(sys.argv) != 2:
