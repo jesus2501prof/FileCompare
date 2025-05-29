@@ -13,21 +13,23 @@ def procesar_sql(contenido):
     cambios_realizados = False
     original = contenido
     
-    # 1. Reemplazar JOIN por INNER JOIN (versión corregida sin lookbehind problemático)
+    # 1. Reemplazar JOIN por INNER JOIN (versión insensible a mayúsculas/minúsculas)
     def replacer(match):
         nonlocal cambios_realizados
         cambios_realizados = True
-        return 'INNER JOIN'
+        return match.group(1) + 'INNER JOIN'
     
-    # Patrón más simple que evita lookbehind complejo
+    # Patrón que evita modificar JOINs que ya tienen calificador
     join_pattern = re.compile(r'''
         (^|\s)                    # Inicio de línea o espacio
-        (?!\b(?:INNER|LEFT|RIGHT|FULL|OUTER|LOOP|HASH|MERGE)\s+JOIN\b)  # No debe tener modificador
-        \bJOIN\b                  # La palabra JOIN
+        (?!                       # Negative lookahead para JOINs que no queremos modificar
+          (?:INNER|LEFT|RIGHT|FULL|OUTER|LOOP|HASH|MERGE)\s+JOIN  # JOINs con calificador
+          |JOIN\s+[^ ]+\s*WITH    # JOINs que ya tienen WITH
+        )\b(join)\b               # Solo capturamos 'join' en minúsculas (por el flag IGNORECASE)
         (?=\s)                    # Seguido de espacio
     ''', re.IGNORECASE | re.VERBOSE | re.MULTILINE)
     
-    contenido = join_pattern.sub(r'\1INNER JOIN', contenido)
+    contenido = join_pattern.sub(replacer, contenido)
     
     # 2. Agregar WITH (NOLOCK) a todas las tablas, incluyendo subconsultas
     # Excepto en operaciones UPDATE/DELETE directas
@@ -36,19 +38,19 @@ def procesar_sql(contenido):
     if not is_update_or_delete:
         # Patrón mejorado que detecta tablas en FROM/JOIN incluyendo subconsultas
         table_pattern = re.compile(r'''
-            (\bFROM\b|\b(?:INNER|LEFT|RIGHT|FULL|OUTER)?\s+(?:LOOP|HASH|MERGE)?\s*JOIN\b)\s+  # Cláusula FROM o JOIN
+            (\bfrom\b|\b(?:inner|left|right|full|outer)?\s+(?:loop|hash|merge)?\s*join\b)\s+  # Cláusula FROM o JOIN
             (
                 (?:\[[^\]]+\]\.\[[^\]]+\]|\[[^\]]+\]|[a-zA-Z_][\w]*\.[a-zA-Z_][\w]*|[a-zA-Z_#@][\w]*)  # Nombre de tabla
-                (?!\s*\b(?:WITH|WHERE|GROUP|HAVING|ORDER|UNION|EXCEPT|INTERSECT)\b)  # No capturar palabras clave después
+                (?!\s*\b(?:with|where|group|having|order|union|except|intersect)\b)  # No capturar palabras clave después
             )
-            (?:\s+(?:AS\s+)?(\[[^\]]+\]|[a-zA-Z_][\w]*)?)?  # Alias opcional
+            (?:\s+(?:as\s+)?(\[[^\]]+\]|[a-zA-Z_][\w]*)?)?  # Alias opcional
             (?=\s+|$)  # Lookahead para espacio o fin de línea
         ''', re.IGNORECASE | re.VERBOSE)
         
         def agregar_nolock(match):
             nonlocal cambios_realizados
             full_match = match.group(0)
-            if 'WITH (NOLOCK)' in full_match.upper():
+            if 'with (nolock)' in full_match.lower():
                 return full_match
             
             clause = match.group(1)  # FROM o JOIN
@@ -62,7 +64,7 @@ def procesar_sql(contenido):
             # Determinar si lo que sigue es una palabra clave SQL
             next_text = contenido[match.end():match.end()+20]
             if any(re.match(r'^\s*\b'+kw+r'\b', next_text, re.IGNORECASE) 
-               for kw in ['WHERE', 'GROUP', 'HAVING', 'ORDER', 'UNION', 'EXCEPT', 'INTERSECT', 'ON']):
+               for kw in ['where', 'group', 'having', 'order', 'union', 'except', 'intersect', 'on']):
                 alias = None
             
             cambios_realizados = True
