@@ -13,21 +13,33 @@ def procesar_sql(contenido):
     cambios_realizados = False
     original = contenido
     
-    # 1. Reemplazar solo JOINs que no tienen ningún calificador
+    # 1. Reemplazar JOIN por INNER JOIN (sin usar lookbehind problemático)
     def replacer(match):
         nonlocal cambios_realizados
         cambios_realizados = True
-        return match.group(1) + 'INNER JOIN'
+        return 'INNER JOIN'
     
-    # Patrón que solo captura JOINs sin calificador previo
+    # Patrón que evita modificar JOINs que ya tienen calificador
     join_pattern = re.compile(r'''
         (^|\s)                    # Inicio de línea o espacio
-        (?<!\b(?:INNER|LEFT|RIGHT|FULL|OUTER|LOOP|HASH|MERGE)\s)  # Verificar que no haya calificador antes
-        \b(JOIN)\b                # La palabra JOIN
+        (?!\S+\s+(?:JOIN|join)\b)  # No debe haber palabra antes + JOIN
+        \b(JOIN|join)\b            # La palabra JOIN (case insensitive)
         (?=\s)                    # Seguido de espacio
-    ''', re.IGNORECASE | re.VERBOSE | re.MULTILINE)
+    ''', re.VERBOSE | re.MULTILINE)
     
+    # Primero marcamos los JOINs que NO queremos modificar
+    protected_joins = re.compile(r'\b(?:INNER|LEFT|RIGHT|FULL|OUTER|LOOP|HASH|MERGE)\s+JOIN\b', re.IGNORECASE)
+    contenido = protected_joins.sub(lambda m: f'PROTECTED_{m.group(0)}', contenido)
+    
+    # Luego modificamos los JOINs simples
     contenido = join_pattern.sub(replacer, contenido)
+    
+    # Finalmente restauramos los JOINs protegidos
+    contenido = re.sub(r'PROTECTED_', '', contenido)
+    
+    if contenido != original:
+        cambios_realizados = True
+        original = contenido
     
     # 2. Agregar WITH (NOLOCK) a todas las tablas, incluyendo subconsultas
     # Excepto en operaciones UPDATE/DELETE directas
