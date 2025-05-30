@@ -1,132 +1,129 @@
 import re
-import os
+import sys
 from pathlib import Path
+from colorama import init, Fore, Style
 
-class bcolors:
-    BLUE = '\033[94m'
-    GREEN = '\033[92m'
-    RED = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
+# Inicializar colorama para colores en terminal
+init()
 
-def procesar_sql(contenido):
-    cambios_realizados = False
-    original = contenido
-    
-    # 1. Reemplazar JOIN por INNER JOIN (sin usar lookbehind problemático)
-    def replacer(match):
-        nonlocal cambios_realizados
-        cambios_realizados = True
-        return 'INNER JOIN'
-    
-    # Patrón que evita modificar JOINs que ya tienen calificador
-    join_pattern = re.compile(r'''
-        (^|\s)                    # Inicio de línea o espacio
-        (?!\S+\s+(?:JOIN|join)\b)  # No debe haber palabra antes + JOIN
-        \b(JOIN|join)\b            # La palabra JOIN (case insensitive)
-        (?=\s)                    # Seguido de espacio
-    ''', re.VERBOSE | re.MULTILINE)
-    
-    # Primero marcamos los JOINs que NO queremos modificar
-    protected_joins = re.compile(r'\b(?:INNER|LEFT|RIGHT|FULL|OUTER|LOOP|HASH|MERGE)\s+JOIN\b', re.IGNORECASE)
-    contenido = protected_joins.sub(lambda m: f'PROTECTED_{m.group(0)}', contenido)
-    
-    # Luego modificamos los JOINs simples
-    contenido = join_pattern.sub(replacer, contenido)
-    
-    # Finalmente restauramos los JOINs protegidos
-    contenido = re.sub(r'PROTECTED_', '', contenido)
-    
-    if contenido != original:
-        cambios_realizados = True
-        original = contenido
-    
-    # 2. Agregar WITH (NOLOCK) a todas las tablas, incluyendo subconsultas
-    # Excepto en operaciones UPDATE/DELETE directas
-    is_update_or_delete = re.search(r'^\s*(?:UPDATE|DELETE)\b', contenido, re.IGNORECASE | re.MULTILINE)
-    
-    if not is_update_or_delete:
-        # Patrón mejorado que detecta tablas en FROM/JOIN incluyendo subconsultas
-        table_pattern = re.compile(r'''
-            (\bFROM\b|\b(?:INNER|LEFT|RIGHT|FULL|OUTER)?\s+(?:LOOP|HASH|MERGE)?\s*JOIN\b)\s+  # Cláusula FROM o JOIN
-            (
-                (?:\[[^\]]+\]\.\[[^\]]+\]|\[[^\]]+\]|[a-zA-Z_][\w]*\.[a-zA-Z_][\w]*|[a-zA-Z_#@][\w]*)  # Nombre de tabla
-                (?!\s*\b(?:WITH|WHERE|GROUP|HAVING|ORDER|UNION|EXCEPT|INTERSECT)\b)  # No capturar palabras clave después
-            )
-            (?:\s+(?:AS\s+)?(\[[^\]]+\]|[a-zA-Z_][\w]*)?)?  # Alias opcional
-            (?=\s+|$)  # Lookahead para espacio o fin de línea
-        ''', re.IGNORECASE | re.VERBOSE)
-        
-        def agregar_nolock(match):
-            nonlocal cambios_realizados
-            full_match = match.group(0)
-            if 'WITH (NOLOCK)' in full_match.upper():
-                return full_match
-            
-            clause = match.group(1)  # FROM o JOIN
-            table_name = match.group(2)  # Nombre de tabla
-            alias = match.group(3)  # Alias si existe
-            
-            # Omitir solo tablas temporales y variables de tabla
-            if table_name.startswith('#') or table_name.startswith('@'):
-                return full_match
-            
-            # Determinar si lo que sigue es una palabra clave SQL
-            next_text = contenido[match.end():match.end()+20]
-            if any(re.match(r'^\s*\b'+kw+r'\b', next_text, re.IGNORECASE) 
-               for kw in ['WHERE', 'GROUP', 'HAVING', 'ORDER', 'UNION', 'EXCEPT', 'INTERSECT', 'ON']):
-                alias = None
-            
-            cambios_realizados = True
-            if alias:
-                return f"{clause} {table_name} {alias} WITH (NOLOCK)"
-            else:
-                return f"{clause} {table_name} WITH (NOLOCK)"
-        
-        # Procesar todo el contenido (incluyendo subconsultas)
-        contenido = table_pattern.sub(agregar_nolock, contenido)
-    
-    return contenido, cambios_realizados
+def print_colored(status, message):
+    """Imprime mensajes con color según el estado"""
+    colors = {
+        'modified': Fore.GREEN,
+        'unchanged': Fore.BLUE,
+        'error': Fore.RED,
+        'info': Fore.CYAN
+    }
+    print(f"{colors[status]}{message}{Style.RESET_ALL}")
 
-def procesar_archivo(archivo):
+def normalize_case(sql_content):
+    """Normaliza palabras clave SQL a mayúsculas"""
+    keywords = ['SELECT', 'FROM', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 
+                'WHERE', 'HAVING', 'EXISTS', 'WITH', 'NOLOCK', 'UPDATE', 'DELETE', 'AS']
+    
+    for keyword in keywords:
+        sql_content = re.sub(r'\b' + keyword + r'\b', keyword, sql_content, flags=re.IGNORECASE)
+    return sql_content
+
+def normalize_joins(sql_content):
+    """Reemplaza JOIN puros por INNER JOIN"""
+    pattern = re.compile(r'(?<!\w)(JOIN)(?!\s*\w+ JOIN)', re.IGNORECASE)
+    return pattern.sub('INNER JOIN', sql_content)
+
+def add_nolock_to_subqueries(sql_content):
+    """Agrega WITH (NOLOCK) a subconsultas en WHERE/HAVING"""
+    subquery_pattern = re.compile(
+        r'(WHERE|HAVING)\s*(NOT\s*)?(EXISTS\s*)?\(?\s*(SELECT\s+.+?\s+FROM\s+.+?)(?=\s*(?:WITH\s*\(|\)|\s+WHERE|\s+GROUP|\s+HAVING|\s+ORDER|\s+FOR|$))',
+        re.IGNORECASE | re.DOTALL
+    )
+    
+    def process_subquery(match):
+        prefix = match.group(1).upper()
+        not_exists = match.group(2) or ''
+        exists_keyword = match.group(3) or ''
+        subquery = match.group(4)
+        processed_subquery = add_nolock_hints(subquery, is_main_query=False)
+        return f"{prefix}{not_exists}{exists_keyword}({processed_subquery}"
+
+    return subquery_pattern.sub(process_subquery, sql_content)
+
+def add_nolock_hints(sql_content, is_main_query=True):
+    """Agrega WITH (NOLOCK) a tablas calificadas"""
+    table_ref_pattern = re.compile(
+        r'(FROM|JOIN)\s+(?![\#@])((\[?\w+\]?\.)?\[?\w+\]?)(\s+(AS\s+)?\w*\s*)?(?!(WITH\s*\(\s*NOLOCK\s*\)))',
+        re.IGNORECASE
+    )
+    
+    def add_hint(match):
+        if is_main_query and re.search(r'^\s*(UPDATE|DELETE)\b', sql_content[:match.start()], re.IGNORECASE):
+            return match.group(0)
+        return f"{match.group(1)} {match.group(2)}{match.group(4) or ''} WITH (NOLOCK)"
+    
+    return table_ref_pattern.sub(add_hint, sql_content)
+
+def process_sql_file(file_path):
+    """Procesa un archivo SQL y devuelve si fue modificado"""
     try:
-        with open(archivo, 'r', encoding='utf-8') as f:
-            contenido = f.read()
+        with open(file_path, 'r', encoding='utf-8') as file:
+            original_content = file.read()
         
-        contenido_modificado, cambios = procesar_sql(contenido)
+        # Paso 1: Normalizar JOINs
+        step1 = normalize_joins(original_content)
         
-        if cambios:
-            with open(archivo, 'w', encoding='utf-8') as f:
-                f.write(contenido_modificado)
-            print(f"{bcolors.GREEN}[MODIFICADO]{bcolors.ENDC} {archivo}")
-        else:
-            print(f"{bcolors.BLUE}[SIN CAMBIOS]{bcolors.ENDC} {archivo}")
-    
+        # Paso 2: Procesar subconsultas
+        step2 = add_nolock_to_subqueries(step1)
+        
+        # Paso 3: Procesar consulta principal
+        step3 = add_nolock_hints(step2)
+        
+        # Paso 4: Normalizar mayúsculas
+        final_content = normalize_case(step3)
+        
+        if final_content == original_content:
+            return 'unchanged'
+        
+        with open(file_path, 'w', encoding='utf-8') as file:
+            file.write(final_content)
+        return 'modified'
+        
     except Exception as e:
-        print(f"{bcolors.RED}[ERROR]{bcolors.ENDC} {archivo} - {str(e)}")
+        print_colored('error', f"Error procesando {file_path}: {str(e)}")
+        return 'error'
 
-def procesar_directorio(directorio):
-    for root, _, files in os.walk(directorio):
-        for file in files:
-            if file.lower().endswith('.sql'):
-                archivo_completo = os.path.join(root, file)
-                procesar_archivo(archivo_completo)
-
-def main():
-    if len(sys.argv) != 2:
-        print(f"Uso: python {sys.argv[0]} <directorio>")
-        sys.exit(1)
+def process_directory(root_dir):
+    """Procesa recursivamente todos los archivos .sql en un directorio"""
+    root_path = Path(root_dir)
+    if not root_path.exists():
+        print_colored('error', f"El directorio {root_dir} no existe")
+        return
     
-    directorio = sys.argv[1]
+    print_colored('info', f"\nAnalizando directorio: {root_path.resolve()}")
     
-    if not os.path.isdir(directorio):
-        print(f"{bcolors.RED}Error: {directorio} no es un directorio válido{bcolors.ENDC}")
-        sys.exit(1)
+    modified_count = 0
+    unchanged_count = 0
+    error_count = 0
     
-    print(f"\n{bcolors.BOLD}Iniciando procesamiento recursivo en: {directorio}{bcolors.ENDC}\n")
-    procesar_directorio(directorio)
-    print(f"\n{bcolors.BOLD}Procesamiento completado{bcolors.ENDC}")
+    for sql_file in root_path.rglob('*.sql'):
+        result = process_sql_file(sql_file)
+        
+        if result == 'modified':
+            print_colored('modified', f"MODIFICADO: {sql_file}")
+            modified_count += 1
+        elif result == 'unchanged':
+            print_colored('unchanged', f"SIN CAMBIOS: {sql_file}")
+            unchanged_count += 1
+        else:
+            error_count += 1
+    
+    print_colored('info', f"\nResumen:")
+    print_colored('modified', f"Archivos modificados: {modified_count}")
+    print_colored('unchanged', f"Archivos sin cambios: {unchanged_count}")
+    print_colored('error', f"Archivos con errores: {error_count}")
 
 if __name__ == "__main__":
-    import sys
-    main()
+    if len(sys.argv) != 2:
+        print("USO: python sql_normalizer.py <directorio>")
+        sys.exit(1)
+    
+    target_dir = sys.argv[1]
+    process_directory(target_dir)
